@@ -1,0 +1,159 @@
+# Chat Editor Reasoning-Fragment Fix
+
+## Symptom
+
+The failure sequence was:
+
+1. Open a conversation containing an assistant response with no reasoning
+   fragment.
+2. Use the Deekseep editor to add reasoning content.
+3. Save and restart DeepSeek.
+4. Reopen the conversation.
+5. The new reasoning is missing, and the original assistant response is also
+   invisible.
+
+The original response was not intentionally deleted. The old editor wrote an
+invalid fragment array that the host could not deserialize after restart.
+
+## Root Cause
+
+### Missing Required Fragment ID
+
+The old insertion path created:
+
+```json
+{"type":"THINK","content":"new reasoning"}
+```
+
+The target's reasoning-fragment serializer requires:
+
+| Field | Requirement |
+|---|---|
+| `type` | Optional, defaults to `THINK` |
+| `id` | Required integer |
+| `content` | Required string |
+| `elapsed_secs` | Optional |
+| `references` | Optional |
+| `stage_id` | Optional |
+
+Because `id` was absent, strict host deserialization failed for the entire
+fragment list. The host did not skip only the invalid reasoning object, so the
+valid `RESPONSE` in the same array also disappeared from rendering.
+
+The editor itself used permissive `org.json` parsing, which is why the save could
+appear correct until the host process restarted and loaded its typed model.
+
+### Inconsistent Message-Level Flag
+
+The old SQL statement updated only `fragments`. A message that originally had no
+reasoning retained `thinking_enabled=0`, leaving row metadata inconsistent even
+if the new fragment had otherwise been valid.
+
+### Existing Damaged Rows
+
+Correcting only future writes would not restore rows already saved by the broken
+version. They required a narrow compatibility migration.
+
+## Evidence
+
+Normal protocol samples contain numeric IDs:
+
+```json
+{
+  "thinking_enabled": false,
+  "fragments": [
+    {"id": 2, "type": "RESPONSE", "content": "answer"}
+  ]
+}
+```
+
+A response with reasoning uses `thinking_enabled=true` and a numeric ID on the
+`THINK` object. Static serializer inspection also confirmed that `id` and
+`content` are required constructor fields.
+
+## Fix
+
+Both stable 1.7.1 interfaces now use the same canonical structured transform,
+`upsertFragmentContent()`:
+
+1. repair any old `THINK` object whose ID is missing or nonnumeric;
+2. scan existing numeric IDs;
+3. assign the new reasoning object `max(id)+1`;
+4. insert it before the existing response in array order;
+5. preserve every existing fragment, response ID, and response body;
+6. set `thinking_enabled=1` in the same database update when nonempty reasoning
+   is present.
+
+Using a new unique ID avoids modifying the identity of the original response.
+Array order still places reasoning before the answer.
+
+### Custom Reasoning Duration
+
+The host model represents displayed reasoning time with the optional
+`elapsed_secs: Float` field on the `THINK` fragment. The editor exposes this
+as **Reasoning duration (seconds)** and accepts a finite number greater than or
+equal to zero. It writes a JSON number, not a quoted string. Clearing the field
+removes `elapsed_secs`; it does not remove the reasoning content.
+
+Duration changes use `updateThinkElapsed()`, which first repairs a malformed
+THINK ID and then modifies only the matching reasoning object. The existing
+`RESPONSE`, its ID, its content, and all unrelated fragments remain unchanged.
+
+## Automatic Migration
+
+At module startup, before the host opens a conversation, each stable 1.7.1
+interface scans all local account databases and session message tables.
+
+The migration:
+
+- reads assistant rows that contain a reasoning fragment;
+- changes only `THINK` fragments with a missing or nonnumeric ID;
+- assigns a unique numeric ID;
+- sets `thinking_enabled=1`;
+- keeps the response and all other fragments unchanged;
+- freezes only a repaired session against immediate stale server overwrite;
+- is idempotent, so a second startup performs no write.
+
+The log line is:
+
+```text
+repairMalformedThinkFragments fixed=N
+```
+
+## Regression Test
+
+`module/tests/com/dsmod/probe/ChatEditorThinkingRegressionTest.java` covers:
+
+- adding reasoning to `RESPONSE id=2`;
+- creation of `THINK id=3` before the response;
+- preservation of response ID and content;
+- detection of nonempty reasoning;
+- repair of a legacy `THINK` with no ID;
+- idempotence of a second repair pass.
+- numeric `elapsed_secs` insertion and removal;
+- rejection of negative, NaN, and infinite durations;
+- preservation of the response while duration is changed.
+
+Run it after building the stable project:
+
+```bash
+cd module
+bash build.sh
+bash test-thinking-regression.sh
+```
+
+Expected result:
+
+```text
+PASS: THINK content/id/duration transforms preserve the response
+```
+
+## Scope and Recovery Limit
+
+The writer and migration are present in both stable 1.7.1 APKs because modern
+and traditional interface builds compile the same canonical feature core. The
+former test editions and load probe are not 1.7.1 release targets.
+
+The migration can restore visibility when the original `RESPONSE` still exists
+in the malformed JSON row. It cannot reconstruct response text that a later
+server synchronization or manual operation already deleted from the database.
